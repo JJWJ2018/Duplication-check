@@ -33,7 +33,7 @@ const list = k => env(k, '').split(',').map(s => s.trim()).filter(Boolean);
 const bool = (k, d) => String(env(k, d)).toLowerCase() === 'true';
 
 const CFG = {
-  base: env('ASSETS_API_BASE', '').replace(/\/$/, ''),
+  base: env('ASSETS_API_BASE', '').trim().replace(/\/+$/, ''),
   checksumField: env('CHECKSUM_FIELD', 'firstExtractedChecksum'),
   dateField: env('CAPTURE_DATE_FIELD', 'created'),
   matchDate: bool('MATCH_CAPTURE_DATE', 'true'),
@@ -61,10 +61,28 @@ function readRaw(req) {
 
 function validSignature(raw, header, secret) {
   if (!header || !secret) return false;
-  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
-  const a = Buffer.from(String(header).trim());
+  const expected = crypto.createHmac('sha256', secret.trim()).update(raw).digest('hex');
+  // Accept "abc…", "sha256=abc…" and upper case.
+  const got = String(header).trim().replace(/^sha256=/i, '').toLowerCase();
+  const a = Buffer.from(got);
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Diagnostics for a failed signature check. Never logs the secret or full signatures.
+function logSignatureDebug(req, raw) {
+  const sig = String(req.headers['x-hook-signature'] || '');
+  const secret = String(process.env.WEBHOOK_SECRET || '');
+  console.log('[sig-debug]', JSON.stringify({
+    headerPresent: !!sig,
+    headerLength: sig.length,
+    headerStart: sig.slice(0, 6),
+    sigHeaders: Object.keys(req.headers).filter(h => /sign|hook|hmac/i.test(h)),
+    rawBodyLength: raw.length,
+    contentType: req.headers['content-type'] || null,
+    secretLength: secret.length,
+    secretHasWhitespace: secret !== secret.trim(),
+  }));
 }
 
 const qEsc = s => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -95,10 +113,12 @@ async function login(force = false) {
   const r = await fetch(CFG.base + '/auth/api-key-login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiKey: process.env.ASSETS_API_KEY }),
+    body: JSON.stringify({ apiKey: String(process.env.ASSETS_API_KEY || '').trim() }),
   });
-  if (!r.ok) throw new Error('Assets login failed (HTTP ' + r.status + ')');
-  const j = await r.json();
+  const text = await r.text();
+  if (!r.ok) throw new Error('Assets login failed (HTTP ' + r.status + '): ' + text.slice(0, 300));
+  let j = {};
+  try { j = JSON.parse(text); } catch (_) { throw new Error('Login response is not JSON: ' + text.slice(0, 300)); }
   if (!j.authToken) throw new Error('Login returned no authToken, check ASSETS_API_BASE and the API key');
   tokenCache = j.authToken;
   return tokenCache;
@@ -115,7 +135,7 @@ async function api(path, init = {}) {
 async function search(q, size = 50) {
   const params = new URLSearchParams({ q, types: 'Asset', size: String(size) });
   const r = await api('/api/search?' + params.toString());
-  if (!r.ok) throw new Error('Search failed (HTTP ' + r.status + '): ' + q);
+  if (!r.ok) throw new Error('Search failed (HTTP ' + r.status + '): ' + q + ' :: ' + (await r.text()).slice(0, 300));
   const j = await r.json();
   return j.hits || [];
 }
@@ -128,7 +148,7 @@ async function updateMetadata(assetId, metadata) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(),
   });
-  if (!r.ok) throw new Error('Metadata update failed (HTTP ' + r.status + ') via ' + CFG.updateEndpoint);
+  if (!r.ok) throw new Error('Metadata update failed (HTTP ' + r.status + ') via ' + CFG.updateEndpoint + ' :: ' + (await r.text()).slice(0, 300));
 }
 
 // ---------- duplicate check ----------
@@ -208,6 +228,7 @@ module.exports = async (req, res) => {
 
   const rawBody = await readRaw(req);
   if (!validSignature(rawBody, req.headers['x-hook-signature'], process.env.WEBHOOK_SECRET)) {
+    logSignatureDebug(req, rawBody);
     return res.status(400).json({ error: 'Invalid webhook signature' });
   }
 
@@ -249,6 +270,7 @@ module.exports = async (req, res) => {
     const notified = matches.length ? await notify(asset, matches) : [];
     return res.status(200).json({ assetId, duplicates: matches.length, notified });
   } catch (e) {
+    console.error('[duplicate-check]', assetId, String(e?.message || e));
     // 5xx makes Assets retry (max 3 attempts); the flag field keeps retries idempotent.
     return res.status(502).json({ error: String(e?.message || e), assetId });
   }
