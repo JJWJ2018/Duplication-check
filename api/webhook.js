@@ -81,9 +81,10 @@ const sameSecond = (a, b) => a && b && Math.floor(a.getTime() / 1000) === Math.f
 const hasTime = d => d && (d.getUTCHours() + d.getUTCMinutes() + d.getUTCSeconds()) !== 0;
 const startsWithAny = (path, prefixes) => prefixes.some(p => String(path || '').startsWith(p));
 
-// The payload format differs per event; find the asset id defensively.
+// Assets 10 payload: { id: <event id>, time, type: 'asset.metadata-extracted', data: { asset: { id, metadata } } }
+// Note: top-level `id` is the EVENT id, not the asset id.
 function pickAssetId(body) {
-  return body?.assetId || body?.asset?.id || body?.id || body?.data?.assetId || body?.data?.id || null;
+  return body?.data?.asset?.id || body?.data?.assetId || body?.assetId || body?.asset?.id || null;
 }
 
 // ---------- Assets API ----------
