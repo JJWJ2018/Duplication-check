@@ -43,9 +43,51 @@ SDK: `@woodwing/a10-client-sdk@1.0.4`.
    `assetCreator` daarop matcht. Werkt het niet, dan toont het paneel alleen
    "selecteer de nieuwe bestanden". Uitzetten: `AUTO_CHECK_AFTER_UPLOAD: false`.
 
+## Achterkant: automatisch signaleren (`api/webhook.js`)
+Werkt zonder dat iemand het paneel opent. Assets stuurt bij elke nieuwe asset een
+webhook; de functie zoekt duplicaten en:
+1. zet op de nieuwe asset `cf_duplicateCheck` = *Possible duplicate* of *No duplicates
+   found*, en bij treffers `cf_possibleDuplicateOf` = lijst met map, naam, reden en ID;
+2. stuurt bij treffers optioneel een mail (via resend.com) en/of chatbericht.
+Een opgeslagen zoekopdracht `cf_duplicateCheck:"Possible duplicate"` is daarmee de
+werklijst voor de beeldredactie.
+
+Alleen handmatige uploads: zet serviceaccounts en importgebruikers in
+`IGNORE_CREATORS`, en/of beperk met `ONLY_FOLDERS` / `IGNORE_FOLDERS`.
+
+### Inrichten
+1. **Custom fields** (Management Console → Metadata): `cf_duplicateCheck` (tekst) en
+   `cf_possibleDuplicateOf` (tekst, multi-value). Andere namen kan, via env-vars.
+2. **API-key** (Management Console → API).
+3. **Vercel env-vars:** `ASSETS_API_BASE`, `ASSETS_API_KEY`, `WEBHOOK_SECRET`, plus
+   optioneel `IGNORE_CREATORS`, `CAPTURE_DATE_FIELD`, `RESEND_API_KEY` + `MAIL_FROM` +
+   `MAIL_TO`, `CHAT_WEBHOOK_URL`, `ASSET_LINK_TEMPLATE`. Alles staat bovenin
+   `api/webhook.js`.
+4. **Webhook** (Management Console → Webhooks): URL `https://<vercel-url>/api/webhook`,
+   events: het aanmaken van een asset én metadata-wijzigingen (de checksum is bij het
+   eerste event mogelijk nog niet berekend). Kopieer het secret naar `WEBHOOK_SECRET`.
+5. Test: open `https://<vercel-url>/api/webhook` in de browser → `{"ok":true,…}`.
+   Upload daarna een foto die al bestaat en kijk naar de twee velden.
+
+### Te verifiëren (achterkant)
+- **Metadata schrijven.** De functie gebruikt `POST /services/update` (Elvis-stijl,
+  `id` + `metadata` als JSON). Of Assets 10 dit via de API-key ondersteunt, heb ik niet
+  kunnen bevestigen. Werkt het niet: zet het juiste pad in `UPDATE_ENDPOINT`, of zet
+  `WRITE_METADATA=false` en gebruik alleen mail/chat.
+- **Payload.** De event-namen en het exacte payload-formaat staan in de Management
+  Console. De functie zoekt het asset-ID in `assetId`, `asset.id`, `id` of `data.*`.
+- **Timing.** Assets wacht max. 5 seconden en probeert het daarna opnieuw (max. 3×).
+  De functie doet 3–4 API-calls; dat zou moeten passen. Dubbel verwerken wordt
+  voorkomen doordat het vlagveld al gevuld is.
+- **Checksum later berekend?** Als de checksum pas na het aanmaken komt en er daarna
+  geen metadata-event volgt, wordt de asset niet gecontroleerd.
+
+### Lokaal getest
+Met een nagebootste Assets-API: verkeerde handtekening → 400; nieuw duplicaat → velden
+gezet + chatbericht; tweede event → overgeslagen; serviceaccount → overgeslagen.
+
 ## Bekende beperkingen
-- Melding alleen als het paneel open staat. Een mail naar de beeldredactie vraagt
-  een webhook + klein serverless script (niet in dit prototype).
+- Het paneel meldt alleen iets als het open staat; de achterkant (hierboven) vangt dat op.
 - `search()` respecteert `num` niet altijd (zie sdk-verbeterpunten.md); het paneel
   knipt zelf af.
 - Datum zonder tijd (00:00:00) wordt genegeerd, anders geeft "zelfde dag" te veel
