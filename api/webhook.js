@@ -16,7 +16,7 @@
 //   FLAG_FIELD             default cf_duplicateCheck  (custom field, text)
 //   MATCHES_FIELD          default cf_possibleDuplicateOf (custom field, text, multi-value)
 //   WRITE_METADATA         default true
-//   UPDATE_ENDPOINT        default /services/update   (VERIFY, see README)
+//   UPDATE_ENDPOINT        default /api/asset/{id}/metadata
 //
 //   IGNORE_CREATORS        comma-separated user names to skip (service accounts, imports)
 //   ONLY_FOLDERS           comma-separated folder prefixes to check (empty = all)
@@ -40,7 +40,7 @@ const CFG = {
   flagField: env('FLAG_FIELD', 'cf_duplicateCheck'),
   matchesField: env('MATCHES_FIELD', 'cf_possibleDuplicateOf'),
   writeMetadata: bool('WRITE_METADATA', 'true'),
-  updateEndpoint: env('UPDATE_ENDPOINT', '/services/update'),
+  updateEndpoint: env('UPDATE_ENDPOINT', '/api/asset/{id}/metadata'),
   ignoreCreators: list('IGNORE_CREATORS').map(s => s.toLowerCase()),
   onlyFolders: list('ONLY_FOLDERS'),
   ignoreFolders: list('IGNORE_FOLDERS'),
@@ -141,14 +141,15 @@ async function search(q, size = 50) {
 }
 
 async function updateMetadata(assetId, metadata) {
-  // Elvis-compatible update call. VERIFY on Assets 10 (see README).
-  const form = new URLSearchParams({ id: assetId, metadata: JSON.stringify(metadata) });
-  const r = await api(CFG.updateEndpoint, {
+  // Assets 10 public API: POST /api/asset/{id}/metadata with a JSON map of fields.
+  // (The Assets 6 style /services/update is refused for API keys: 403.)
+  const path = CFG.updateEndpoint.replace('{id}', encodeURIComponent(assetId));
+  const r = await api(path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(metadata),
   });
-  if (!r.ok) throw new Error('Metadata update failed (HTTP ' + r.status + ') via ' + CFG.updateEndpoint + ' :: ' + (await r.text()).slice(0, 300));
+  if (!r.ok) throw new Error('Metadata update failed (HTTP ' + r.status + ') via ' + path + ' :: ' + (await r.text()).slice(0, 300));
 }
 
 // ---------- duplicate check ----------
@@ -270,7 +271,10 @@ module.exports = async (req, res) => {
     const notified = matches.length ? await notify(asset, matches) : [];
     return res.status(200).json({ assetId, duplicates: matches.length, notified });
   } catch (e) {
-    console.error('[duplicate-check]', assetId, String(e?.message || e));
+    const c = e?.cause;
+    console.error('[duplicate-check]', assetId, String(e?.message || e),
+      c ? JSON.stringify({ cause: String(c.message || c), code: c.code || null, errno: c.errno || null, host: c.hostname || c.host || null }) : '',
+      JSON.stringify({ base: CFG.base, baseStartsWithHttps: CFG.base.startsWith('https://'), keyLength: String(process.env.ASSETS_API_KEY || '').trim().length }));
     // 5xx makes Assets retry (max 3 attempts); the flag field keeps retries idempotent.
     return res.status(502).json({ error: String(e?.message || e), assetId });
   }

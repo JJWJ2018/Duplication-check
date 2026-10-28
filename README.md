@@ -70,12 +70,11 @@ Alleen handmatige uploads: zet serviceaccounts en importgebruikers in
    Upload daarna een foto die al bestaat en kijk naar de twee velden.
 
 ### Te verifiëren (achterkant)
-- **Metadata schrijven.** De functie gebruikt `POST /services/update` (Elvis-stijl,
-  `id` + `metadata` als JSON). Of Assets 10 dit via de API-key ondersteunt, heb ik niet
-  kunnen bevestigen. Werkt het niet: zet het juiste pad in `UPDATE_ENDPOINT`, of zet
-  `WRITE_METADATA=false` en gebruik alleen mail/chat.
-- **Payload.** De event-namen en het exacte payload-formaat staan in de Management
-  Console. De functie zoekt het asset-ID in `assetId`, `asset.id`, `id` of `data.*`.
+- **Metadata schrijven.** Via `POST /api/asset/{id}/metadata` (JSON met velden),
+  volgens de API-referentie op api.swivle.com. `/services/update` (Assets 6-stijl)
+  geeft met een API-key 403. Alleen mail/chat: `WRITE_METADATA=false`.
+- **Payload.** Event `asset.metadata-extracted`; het asset-ID staat in `data.asset.id`
+  (de `id` bovenaan is het event-ID).
 - **Timing.** Assets wacht max. 5 seconden en probeert het daarna opnieuw (max. 3×).
   De functie doet 3–4 API-calls; dat zou moeten passen. Dubbel verwerken wordt
   voorkomen doordat het vlagveld al gevuld is.
