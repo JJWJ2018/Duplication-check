@@ -102,7 +102,7 @@
       <div class="msg"><div class="loader"></div>Connecting to Assets…</div>
     </div>
   </div>
-  <div class="foot" id="foot">Matches on identical file and on capture date + time.</div>
+  <div class="foot" id="foot">Matches on identical file, capture date + time and file name.</div>
 </div>
 
 <script src="config.js"></script>
@@ -110,6 +110,7 @@
   const CFG = Object.assign({
     CHECKSUM_FIELD: 'firstExtractedChecksum',
     MATCH_CAPTURE_DATE: true,
+    MATCH_FILENAME: true,
     CAPTURE_DATE_FIELDS: ['created'],
     REQUIRE_TIME_PART: true,
     MAX_SELECTION: 20,
@@ -202,6 +203,11 @@
       }
     }
 
+    const name = raw(md(full, 'filename'));
+    if (CFG.MATCH_FILENAME && name) {
+      const hits = await search(`filename:"${qEsc(name)}"`);
+      hits.filter(h => String(md(h, 'filename') || '') === String(name)).forEach(h => add(h, 'name'));
+    }
     return { asset: full, checksum, dateField, captured, matches: [...found.values()] };
   }
 
@@ -225,7 +231,7 @@
 
   function renderResult(r) {
     const { asset, checksum, captured, matches } = r;
-    if (!checksum && !captured) {
+    if (!checksum && !captured && !matches.length) {
       return cardShell(asset, `<span class="status info"><span class="dot"></span>Cannot check: no checksum or capture date on this file</span>`);
     }
     if (!matches.length) {
@@ -242,6 +248,7 @@
             <div class="chips">
               ${reasons.has('file') ? '<span class="chip strong">Identical file</span>' : ''}
               ${reasons.has('date') ? '<span class="chip">Same capture time</span>' : ''}
+              ${reasons.has('name') ? '<span class="chip">Same file name</span>' : ''}
             </div>
           </div>
         </div>

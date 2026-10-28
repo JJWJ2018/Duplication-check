@@ -13,6 +13,7 @@
 //   CHECKSUM_FIELD         default firstExtractedChecksum
 //   CAPTURE_DATE_FIELD     default created            (VERIFY in your schema)
 //   MATCH_CAPTURE_DATE     default true
+//   MATCH_FILENAME         default true  (same file name, weakest signal)
 //   FLAG_FIELD             default cf_duplicateCheck  (custom field, text)
 //   MATCHES_FIELD          default cf_possibleDuplicateOf (custom field, text, multi-value)
 //   WRITE_METADATA         default true
@@ -37,6 +38,7 @@ const CFG = {
   checksumField: env('CHECKSUM_FIELD', 'firstExtractedChecksum'),
   dateField: env('CAPTURE_DATE_FIELD', 'created'),
   matchDate: bool('MATCH_CAPTURE_DATE', 'true'),
+  matchFilename: bool('MATCH_FILENAME', 'true'),
   flagField: env('FLAG_FIELD', 'cf_duplicateCheck'),
   matchesField: env('MATCHES_FIELD', 'cf_possibleDuplicateOf'),
   writeMetadata: bool('WRITE_METADATA', 'true'),
@@ -175,6 +177,12 @@ async function findDuplicates(asset) {
       .filter(h => sameSecond(toDate(h.metadata?.[CFG.dateField]), captured))
       .forEach(h => add(h, 'same capture time'));
   }
+  const name = raw(m.filename);
+  if (CFG.matchFilename && name) {
+    (await search(`filename:"${qEsc(name)}"`))
+      .filter(h => String(h.metadata?.filename || '') === String(name))
+      .forEach(h => add(h, 'same file name'));
+  }
   return { checksum, captured, matches: [...found.values()] };
 }
 
@@ -254,11 +262,19 @@ module.exports = async (req, res) => {
     if (startsWithAny(m.folderPath, CFG.ignoreFolders)) return res.status(200).json({ skipped: 'ignored folder', assetId });
 
     // Checksum may not be extracted yet on the first event; a later update event will retry.
-    if (!raw(m[CFG.checksumField]) && !(CFG.matchDate && toDate(m[CFG.dateField]))) {
+    if (!raw(m[CFG.checksumField]) && !(CFG.matchDate && toDate(m[CFG.dateField])) && !(CFG.matchFilename && m.filename)) {
       return res.status(200).json({ skipped: 'no checksum or capture date yet', assetId });
     }
 
-    const { matches } = await findDuplicates(asset);
+    const { matches, checksum, captured } = await findDuplicates(asset);
+    // One summary line per checked asset, to see which signal did (not) fire.
+    console.log('[duplicate-check]', JSON.stringify({
+      assetId: asset.id, filename: m.filename || null,
+      hasChecksum: !!checksum, dateField: CFG.dateField,
+      captureDate: raw(m[CFG.dateField]) ?? null, captureDateUsed: !!(captured && hasTime(captured)),
+      dateLikeFields: Object.keys(m).filter(k => /date|created|time/i.test(k)),
+      matches: matches.map(x => ({ id: x.hit.id, reasons: [...x.reasons] })),
+    }));
 
     if (CFG.writeMetadata) {
       const md = { [CFG.flagField]: matches.length ? FLAG_POSSIBLE : FLAG_CLEAN };

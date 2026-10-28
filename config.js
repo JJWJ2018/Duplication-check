@@ -8,6 +8,9 @@ window.PLUGIN_CONFIG = {
   // resized copies that have a different checksum.
   MATCH_CAPTURE_DATE: true,
 
+  // Also match on identical file name. Weakest signal, shown as "Same file name".
+  MATCH_FILENAME: true,
+
   // Candidate field names for the capture date, first one present wins.
   // VERIFY against your schema (Management Console > Metadata).
   CAPTURE_DATE_FIELDS: ['created', 'dateCreated', 'contentCreated', 'dateTimeOriginal'],
