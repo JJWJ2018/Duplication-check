@@ -284,29 +284,38 @@
     const inGroup = new Set(groups.flatMap(g => [g.original, ...g.copies].map(a => a.id)));
 
     // 6. Possible duplicates: same capture time or same file name, but not the same file.
+    //    Grouped into clusters, so each set of variants is shown once.
+    const parent = new Map();
+    const find = x => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+    const union = (a, b) => { parent.has(a) || parent.set(a, a); parent.has(b) || parent.set(b, b); const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
+    const reasons = new Map(); // id -> Set('date'|'name')
+    const mark = (id, r) => (reasons.get(id) || reasons.set(id, new Set()).get(id)).add(r);
+    const linkList = (list, r) => {
+      if (!list || list.length < 2) return;
+      if (!list.some(a => selectedIds.has(a.id))) return;
+      // Only link files that are NOT the same file (identical files are handled above).
+      const distinctSums = new Set(list.map(a => md(a, CFG.CHECKSUM_FIELD) || a.id));
+      if (distinctSums.size < 2) return;
+      for (let i = 1; i < list.length; i++) union(list[0].id, list[i].id);
+      list.forEach(a => mark(a.id, r));
+    };
     const bySecond = new Map(), byName = new Map();
     everything.forEach(a => {
       const d = captureDate(a);
-      if (d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) (bySecond.get(secondKey(d)) || bySecond.set(secondKey(d), []).get(secondKey(d))).push(a);
+      if (CFG.MATCH_CAPTURE_DATE && d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) (bySecond.get(secondKey(d)) || bySecond.set(secondKey(d), []).get(secondKey(d))).push(a);
       const n = md(a, 'filename');
       if (CFG.MATCH_FILENAME && n) (byName.get(n) || byName.set(n, []).get(n)).push(a);
     });
-    const possible = [];
-    selected.forEach(a => {
-      const sum = md(a, CFG.CHECKSUM_FIELD);
-      const others = new Map();
-      const add = (list, reason) => (list || []).forEach(o => {
-        if (o.id === a.id) return;
-        if (sum && md(o, CFG.CHECKSUM_FIELD) === sum) return; // already an identical file
-        const e = others.get(o.id) || { asset: o, reasons: new Set() };
-        e.reasons.add(reason); others.set(o.id, e);
-      });
-      const d = captureDate(a);
-      if (CFG.MATCH_CAPTURE_DATE && d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) add(bySecond.get(secondKey(d)), 'date');
-      if (CFG.MATCH_FILENAME && md(a, 'filename')) add(byName.get(md(a, 'filename')), 'name');
-      if (others.size) possible.push({ asset: a, others: [...others.values()] });
-    });
-
+    bySecond.forEach(list => linkList(list, 'date'));
+    byName.forEach(list => linkList(list, 'name'));
+    const clusters = new Map();
+    [...parent.keys()].forEach(id => { const r = find(id); (clusters.get(r) || clusters.set(r, []).get(r)).push(all.get(id)); });
+    const possible = [...clusters.values()]
+      .filter(members => members.length > 1 && members.some(m => selectedIds.has(m.id)))
+      .map(members => ({
+        members: [...members].sort((x, y) => createdTime(x) - createdTime(y) || String(x.id).localeCompare(String(y.id)))
+          .map(a => ({ asset: a, reasons: reasons.get(a.id) || new Set(), selected: selectedIds.has(a.id) })),
+      }));
     const noData = selected.filter(a => !md(a, CFG.CHECKSUM_FIELD) && !captureDate(a) && !md(a, 'filename')).length;
     return { selected, groups, possible, warnings, inGroup, noData };
   }
@@ -356,7 +365,7 @@
         ? `No duplicates found in ${n} file${n > 1 ? 's' : ''}`
         : `${n} file${n > 1 ? 's' : ''} checked`}</span>
       ${clean ? '' : `<p class="sub" style="margin-top:8px;white-space:normal">
-        ${r.groups.length ? `<b>${allCopies.length}</b> identical cop${allCopies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> possible duplicate${r.possible.length > 1 ? 's' : ''} to review` : ''}
+        ${r.groups.length ? `<b>${allCopies.length}</b> identical cop${allCopies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> group${r.possible.length > 1 ? 's' : ''} of possible duplicates to review` : ''}
       </p>`}
       ${copies.length ? `<button class="btn" id="showCopies">Show ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'} in Assets</button>
         <div id="removeBox"><button class="btn secondary" id="removeCopies">Keep originals, remove ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'}</button></div>
@@ -381,18 +390,21 @@
       if (r.groups.length > 100) parts.push(`<div class="msg">${r.groups.length - 100} more groups not shown. "Show copies" includes all of them.</div>`);
     }
 
-    // Possible duplicates
+    // Possible duplicates: one block per group of variants.
     if (r.possible.length) {
       parts.push(`<h2>Possible duplicates <span class="hint">review, not included in "Show copies"</span></h2>`);
-      r.possible.slice(0, 100).forEach(p => {
+      r.possible.slice(0, 100).forEach(g => {
+        const ids = g.members.map(m => m.asset.id);
         parts.push(`<div class="card group">
-          ${row(p.asset, '<span class="chip">Selected file</span>')}
-          ${p.others.map(o => row(o.asset,
-            (o.reasons.has('date') ? '<span class="chip">Same capture time</span>' : '') +
-            (o.reasons.has('name') ? '<span class="chip">Same file name</span>' : ''))).join('')}
+          ${g.members.map((m, i) => row(m.asset,
+            (i === 0 ? '<span class="chip ok">Oldest</span>' : '') +
+            (m.reasons.has('date') ? '<span class="chip">Same capture time</span>' : '') +
+            (m.reasons.has('name') ? '<span class="chip">Same file name</span>' : '') +
+            (m.selected ? '' : '<span class="chip">Outside selection</span>'))).join('')}
+          <button class="link" style="margin:4px 4px 6px" data-open-all="${esc(ids.join(','))}">Compare ${ids.length} side by side in Assets</button>
         </div>`);
       });
-      if (r.possible.length > 100) parts.push(`<div class="msg">${r.possible.length - 100} more not shown.</div>`);
+      if (r.possible.length > 100) parts.push(`<div class="msg">${r.possible.length - 100} more groups not shown.</div>`);
     }
 
     $out.innerHTML = parts.join('');
@@ -467,6 +479,8 @@
     if (ev.target.closest('#removeCopies')) return askRemove();
     if (ev.target.closest('#cancelRemove')) { document.getElementById('removeBox').innerHTML = `<button class="btn secondary" id="removeCopies">Keep originals, remove ${lastCopies.length} copies</button>`; return; }
     if (ev.target.closest('#confirmRemove')) return doRemove();
+    const many = ev.target.closest('[data-open-all]');
+    if (many) { try { await client.openAssets(many.dataset.openAll.split(',')); } catch (e) { console.warn('openAssets failed', e); } return; }
     const one = ev.target.closest('[data-open]');
     if (one) { try { await client.openAssets([one.dataset.open]); } catch (e) { console.warn('openAssets failed', e); } }
   });
