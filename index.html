@@ -398,8 +398,8 @@
       if (ids.length <= CFG.MAX_IDS_IN_SEARCH) {
         await client.openSearch(`id:(${ids.map(id => `"${qEsc(id)}"`).join(' OR ')})`, 'assetCreated-desc');
       } else {
-        // Too many ids for one search: tag the copies, then search on the tag.
-        for (const part of chunk(ids, 200)) await client.updateBulkById(part, { [CFG.COPY_FLAG_FIELD]: CFG.COPY_FLAG_VALUE });
+        // Too many ids for one search: tag the copies (max 100 per update call), then search on the tag.
+        for (const part of chunk(ids, 100)) await client.updateBulkById(part, { [CFG.COPY_FLAG_FIELD]: CFG.COPY_FLAG_VALUE });
         await client.openSearch(`${CFG.COPY_FLAG_FIELD}:"${qEsc(CFG.COPY_FLAG_VALUE)}"`, 'assetCreated-desc');
       }
       setBanner(`Showing ${ids.length} cop${ids.length === 1 ? 'y' : 'ies'} in Assets. Review, select all and delete there.`);
