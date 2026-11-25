@@ -87,6 +87,10 @@
   .btn { margin-top: 12px; width: 100%; font: inherit; font-size: 12.5px; font-weight: 600; color: #fff; background: var(--accent);
     border: 0; border-radius: 8px; padding: 9px 12px; cursor: pointer; }
   .btn:disabled { opacity: .6; cursor: default; }
+  .btn.secondary { background: #fff; color: #b42318; border: 1px solid #f3c1bd; margin-top: 8px; }
+  .btn.danger { background: #d92d20; margin-top: 0; }
+  .confirm { margin-top: 10px; padding: 10px; border: 1px solid #f3c1bd; background: #fef3f2; border-radius: 10px; }
+  .confirm .link { display: block; margin: 8px auto 0; }
   h2 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 16px 0 8px; }
   h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--dim); }
   .card.group { padding: 6px; }
@@ -355,6 +359,7 @@
         ${r.groups.length ? `<b>${allCopies.length}</b> identical cop${allCopies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> possible duplicate${r.possible.length > 1 ? 's' : ''} to review` : ''}
       </p>`}
       ${copies.length ? `<button class="btn" id="showCopies">Show ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'} in Assets</button>
+        <div id="removeBox"><button class="btn secondary" id="removeCopies">Keep originals, remove ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'}</button></div>
         <p class="sub" style="white-space:normal;margin-top:6px">Opens only the copies inside your selection, not the originals. Select them there and delete with the normal Assets action.</p>` : ''}
       ${outside ? `<p class="sub" style="white-space:normal;margin-top:6px">${outside} cop${outside === 1 ? 'y is' : 'ies are'} outside your selection. ${outside === 1 ? 'It is' : 'They are'} listed below but not included.</p>` : ''}
       ${r.noData ? `<p class="sub" style="white-space:normal;margin-top:6px">${r.noData} file${r.noData > 1 ? 's have' : ' has'} no checksum, capture date or file name and could not be checked.</p>` : ''}
@@ -416,8 +421,52 @@
     }
   }
 
+  // Remove the copies inside the selection. Two-step confirm inside the panel
+  // (plugin iframes cannot show browser dialogs). Originals are never removed.
+  let lastSelection = [];
+  function askRemove() {
+    const n = lastCopies.length;
+    document.getElementById('removeBox').innerHTML = `
+      <div class="confirm">
+        <p class="sub" style="white-space:normal;margin:0 0 8px"><b>Remove ${n} cop${n === 1 ? 'y' : 'ies'}?</b> Only identical copies inside your selection are removed. The oldest file of each group stays.</p>
+        <button class="btn danger" id="confirmRemove">Yes, remove ${n} cop${n === 1 ? 'y' : 'ies'}</button>
+        <button class="link" id="cancelRemove">Cancel</button>
+      </div>`;
+  }
+  async function doRemove() {
+    const ids = [...new Set(lastCopies.map(c => c.id))];
+    const box = document.getElementById('removeBox');
+    let done = 0, failed = 0;
+    const paint = () => { box.innerHTML = `<p class="sub">Removing… ${done} of ${ids.length}</p><div class="bar"><span style="width:${Math.round(done / ids.length * 100)}%"></span></div>`; };
+    paint();
+    for (const part of chunk(ids, 100)) {
+      try {
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const finish = st => { if (settled) return; settled = true; (st === 'FAILED' ? reject(new Error('Remove failed')) : resolve(st)); };
+          const p = client.remove({ assetIds: part }, info => {
+            if (['COMPLETED', 'COMPLETED_WITH_ERRORS', 'FAILED', 'CANCELLED'].includes(info?.state)) {
+              if (info.errorCount) failed += info.errorCount;
+              finish(info.state);
+            }
+          });
+          // Resolve on the promise too, in case no process updates arrive.
+          Promise.resolve(p).then(() => setTimeout(() => finish('COMPLETED'), 1500), reject);
+        });
+        done += part.length;
+      } catch (e) { failed += part.length; done += part.length; }
+      paint();
+    }
+    setBanner(failed ? `Removed ${ids.length - failed} of ${ids.length} copies. ${failed} could not be removed (check permissions).` : `Removed ${ids.length} cop${ids.length === 1 ? 'y' : 'ies'}. Originals were kept.`);
+    const removed = new Set(ids);
+    check(lastSelection.filter(a => !removed.has(a.id)), 'recheck');
+  }
+
   $out.addEventListener('click', async ev => {
     if (ev.target.closest('#showCopies')) return showCopies();
+    if (ev.target.closest('#removeCopies')) return askRemove();
+    if (ev.target.closest('#cancelRemove')) { document.getElementById('removeBox').innerHTML = `<button class="btn secondary" id="removeCopies">Keep originals, remove ${lastCopies.length} copies</button>`; return; }
+    if (ev.target.closest('#confirmRemove')) return doRemove();
     const one = ev.target.closest('[data-open]');
     if (one) { try { await client.openAssets([one.dataset.open]); } catch (e) { console.warn('openAssets failed', e); } }
   });
@@ -431,6 +480,7 @@
       return;
     }
     const capped = assets.slice(0, CFG.MAX_SELECTION);
+    lastSelection = assets;
     renderProgress(capped.length, 'Starting', 0, 0);
     try {
       const r = await runCheck(capped, (label, done, steps) => { if (my === runId) renderProgress(capped.length, label, done, steps); });
@@ -511,6 +561,11 @@
       openAssets: async ids => window.__demoCalls.push(['openAssets', ids]),
       openSearch: async (q, s) => window.__demoCalls.push(['openSearch', q, s]),
       updateBulkById: async (ids, m) => window.__demoCalls.push(['updateBulkById', ids.length, m]),
+      remove: async ({ assetIds }, handler) => {
+        window.__demoCalls.push(['remove', assetIds]);
+        for (const id of assetIds) { const i = db.findIndex(a => a.id === id); if (i >= 0) db.splice(i, 1); }
+        setTimeout(() => handler?.({ id: 'p1', state: 'COMPLETED', progress: assetIds.length, total: assetIds.length, errorCount: 0 }), 50);
+      },
       search: async ({ q, num }) => {
         await new Promise(r => setTimeout(r, 30));
         let m, hits = [];
