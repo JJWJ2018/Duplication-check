@@ -336,7 +336,11 @@
 
   let lastCopies = [];
   function renderResult(r) {
-    const copies = r.groups.flatMap(g => g.copies);
+    // Only copies inside the selection can be opened for deletion; copies elsewhere are shown but left alone.
+    const selIds = new Set(r.selected.map(a => a.id));
+    const allCopies = r.groups.flatMap(g => g.copies);
+    const copies = allCopies.filter(c => selIds.has(c.id));
+    const outside = allCopies.length - copies.length;
     lastCopies = copies;
     const n = r.selected.length;
     const parts = [];
@@ -348,10 +352,11 @@
         ? `No duplicates found in ${n} file${n > 1 ? 's' : ''}`
         : `${n} file${n > 1 ? 's' : ''} checked`}</span>
       ${clean ? '' : `<p class="sub" style="margin-top:8px;white-space:normal">
-        ${r.groups.length ? `<b>${copies.length}</b> identical cop${copies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> possible duplicate${r.possible.length > 1 ? 's' : ''} to review` : ''}
+        ${r.groups.length ? `<b>${allCopies.length}</b> identical cop${allCopies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> possible duplicate${r.possible.length > 1 ? 's' : ''} to review` : ''}
       </p>`}
       ${copies.length ? `<button class="btn" id="showCopies">Show ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'} in Assets</button>
-        <p class="sub" style="white-space:normal;margin-top:6px">Opens only the copies, not the originals. Select them there and delete with the normal Assets action.</p>` : ''}
+        <p class="sub" style="white-space:normal;margin-top:6px">Opens only the copies inside your selection, not the originals. Select them there and delete with the normal Assets action.</p>` : ''}
+      ${outside ? `<p class="sub" style="white-space:normal;margin-top:6px">${outside} cop${outside === 1 ? 'y is' : 'ies are'} outside your selection. ${outside === 1 ? 'It is' : 'They are'} listed below but not included.</p>` : ''}
       ${r.noData ? `<p class="sub" style="white-space:normal;margin-top:6px">${r.noData} file${r.noData > 1 ? 's have' : ' has'} no checksum, capture date or file name and could not be checked.</p>` : ''}
     </div>`);
 
@@ -365,7 +370,7 @@
       r.groups.slice(0, 100).forEach(g => {
         parts.push(`<div class="card group">
           ${row(g.original, '<span class="chip ok">Keep · oldest</span>')}
-          ${g.copies.map(c => row(c, '<span class="chip strong">Copy</span>')).join('')}
+          ${g.copies.map(c => row(c, selIds.has(c.id) ? '<span class="chip strong">Copy</span>' : '<span class="chip">Copy · outside selection</span>')).join('')}
         </div>`);
       });
       if (r.groups.length > 100) parts.push(`<div class="msg">${r.groups.length - 100} more groups not shown. "Show copies" includes all of them.</div>`);
@@ -396,7 +401,8 @@
     if (btn) { btn.disabled = true; btn.textContent = 'Opening…'; }
     try {
       if (ids.length <= CFG.MAX_IDS_IN_SEARCH) {
-        await client.openSearch(`id:(${ids.map(id => `"${qEsc(id)}"`).join(' OR ')})`, 'assetCreated-desc');
+        // The Assets search box understands "id:a OR id:b", not "id:("a" OR "b")".
+        await client.openSearch(ids.map(id => /^[A-Za-z0-9_-]+$/.test(id) ? `id:${id}` : `id:"${qEsc(id)}"`).join(' OR '), 'assetCreated-desc');
       } else {
         // Too many ids for one search: tag the copies (max 100 per update call), then search on the tag.
         for (const part of chunk(ids, 100)) await client.updateBulkById(part, { [CFG.COPY_FLAG_FIELD]: CFG.COPY_FLAG_VALUE });
@@ -489,6 +495,7 @@
     db.push(A('strawberries.jpg', '/Stock photos/Unsplash', 'sha1:dupA', '2025-06-14T09:12:33Z', '2026-05-18T13:00:00Z', '#f5c2c2'));
     db.push(A('strawberries-2.jpg', '/Stock photos/Unsplash', 'sha1:dupA', '2025-06-14T09:12:33Z', '2026-05-18T13:05:00Z', '#f5c2c2'));
     db.push(A('market_final.jpg', '/Stock photos/Unsplash', 'sha1:dupB', '2025-07-01T11:00:05Z', '2026-05-18T13:00:00Z', '#c2f5d0'));
+    db.push(A('strawberries.jpg', '/Users/demo/Uploads', 'sha1:dupA', '2025-06-14T09:12:33Z', '2026-05-19T09:00:00Z', '#f5c2c2'));
     // possible: cropped version (other checksum, same capture time) and same name
     db.push(A('market_crop.jpg', '/Stock photos/Unsplash', 'sha1:crop', '2025-07-01T11:00:05Z', '2026-05-18T13:10:00Z', '#c2f5d0'));
     db.push(A('IMG_0001.jpg', '/Stock photos/Unsplash', 'sha1:img1', '2026-02-02T09:00:00Z', '2026-05-18T13:00:00Z'));
