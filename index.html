@@ -82,6 +82,15 @@
   .loader { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--line);
     border-top-color: var(--accent); animation: spin .8s linear infinite; margin: 20px auto 10px; }
   .foot { font-size: 11px; color: var(--dim); padding: 10px 16px; border-top: 1px solid var(--line); }
+  .bar { height: 6px; background: var(--soft); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .bar span { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .btn { margin-top: 12px; width: 100%; font: inherit; font-size: 12.5px; font-weight: 600; color: #fff; background: var(--accent);
+    border: 0; border-radius: 8px; padding: 9px 12px; cursor: pointer; }
+  .btn:disabled { opacity: .6; cursor: default; }
+  h2 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 16px 0 8px; }
+  h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--dim); }
+  .card.group { padding: 6px; }
+  .chip.ok { background: var(--ok-50); border-color: #bbf7d0; color: var(--ok); }
 </style>
 </head>
 <body>
@@ -92,7 +101,7 @@
     </span>
     <div>
       <h1>Duplicate check</h1>
-      <p>Is this file already in Assets?</p>
+      <p>Are these files already in Assets?</p>
     </div>
   </div>
 
@@ -113,8 +122,12 @@
     MATCH_FILENAME: true,
     CAPTURE_DATE_FIELDS: ['created'],
     REQUIRE_TIME_PART: true,
-    MAX_SELECTION: 20,
-    MAX_HITS: 50,
+    MAX_SELECTION: 1000,
+    BATCH_SIZE: 20,
+    CONCURRENCY: 4,
+    COPY_FLAG_FIELD: 'cf_duplicateCheck',
+    COPY_FLAG_VALUE: 'Duplicate copy',
+    MAX_IDS_IN_SEARCH: 100,
     AUTO_CHECK_AFTER_UPLOAD: true,
   }, window.PLUGIN_CONFIG || {});
 
@@ -122,19 +135,14 @@
   const $banner = document.getElementById('banner');
   const DEMO = new URLSearchParams(location.search).has('demo');
 
-  if (!CFG.MATCH_CAPTURE_DATE) {
-    document.getElementById('foot').textContent = 'Matches on identical file only.';
-  }
-
   // ---------- helpers ----------
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   const qEsc = s => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const md = (a, f) => a?.metadata?.[f];
+  const raw = v => (v && typeof v === 'object' && !Array.isArray(v) && 'value' in v) ? v.value : v;
+  const md = (a, f) => raw(a?.metadata?.[f]);
   const fileName = a => md(a, 'filename') || md(a, 'name') || a?.id || 'Untitled';
   const folderOf = a => md(a, 'folderPath') || '';
-
-  // Metadata values can come as plain values or as { value, formatted }.
-  const raw = v => (v && typeof v === 'object' && !Array.isArray(v) && 'value' in v) ? v.value : v;
+  const chunk = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };
 
   function toDate(v) {
     v = raw(v);
@@ -144,12 +152,18 @@
   }
   const ymd = d => d.toISOString().slice(0, 10);
   const addDays = (d, n) => new Date(d.getTime() + n * 86400000);
-  const sameSecond = (a, b) => a && b && Math.floor(a.getTime() / 1000) === Math.floor(b.getTime() / 1000);
+  const secondKey = d => String(Math.floor(d.getTime() / 1000));
   const hasTime = d => d && (d.getUTCHours() + d.getUTCMinutes() + d.getUTCSeconds()) !== 0;
-  const fmtDate = d => d ? d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : '';
+  const createdTime = a => (toDate(md(a, 'assetCreated')) || new Date(8.64e15)).getTime();
+  const captureField = a => CFG.CAPTURE_DATE_FIELDS.find(f => toDate(md(a, f)));
+  const captureDate = a => { const f = captureField(a); return f ? toDate(md(a, f)) : null; };
 
-  function captureField(asset) {
-    return CFG.CAPTURE_DATE_FIELDS.find(f => toDate(md(asset, f)));
+  async function pool(items, worker, limit = CFG.CONCURRENCY) {
+    let i = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) { const idx = i++; await worker(items[idx], idx); }
+    });
+    await Promise.all(runners);
   }
 
   // ---------- client (real or demo) ----------
@@ -160,156 +174,268 @@
     return Assets10Client.bootstrap({ handshakeTimeoutMs: 6000 });
   }
 
-  async function search(q, num = CFG.MAX_HITS) {
+  async function search(q, num = 500) {
     const res = await client.search({ q, num, sort: 'assetCreated-asc' });
-    return (res?.hits || []).slice(0, num); // search() does not always respect num
+    const hits = res?.hits || [];
+    return { hits, total: typeof res?.total === 'number' ? res.total : hits.length };
   }
 
-  // Selection metadata may be a subset; fetch the full asset when the fields are missing.
-  async function ensureFull(asset) {
-    if (raw(md(asset, CFG.CHECKSUM_FIELD)) && (!CFG.MATCH_CAPTURE_DATE || captureField(asset))) return asset;
+  // Search for many values at once: field:("a" OR "b" ...). If the result looks
+  // incomplete (fewer hits than total) or the query fails, split the batch.
+  async function searchAnyOf(field, values, onWarn) {
+    if (!values.length) return [];
+    const q = values.length === 1
+      ? `${field}:"${qEsc(values[0])}"`
+      : `${field}:(${values.map(v => `"${qEsc(v)}"`).join(' OR ')})`;
     try {
-      const hits = await search(`id:"${qEsc(asset.id)}"`, 1);
-      if (hits[0]) return { ...asset, ...hits[0], metadata: { ...asset.metadata, ...hits[0].metadata } };
-    } catch (e) { /* fall through with what we have */ }
-    return asset;
+      const { hits, total } = await search(q);
+      if (hits.length < total && values.length > 1) {
+        const half = Math.ceil(values.length / 2);
+        return [...await searchAnyOf(field, values.slice(0, half), onWarn), ...await searchAnyOf(field, values.slice(half), onWarn)];
+      }
+      if (hits.length < total) onWarn?.(`Only ${hits.length} of ${total} matches loaded for one value in ${field}.`);
+      return hits;
+    } catch (e) {
+      if (values.length > 1) {
+        const half = Math.ceil(values.length / 2);
+        return [...await searchAnyOf(field, values.slice(0, half), onWarn), ...await searchAnyOf(field, values.slice(half), onWarn)];
+      }
+      onWarn?.(`Search failed for one value in ${field}: ${e?.message || e}`);
+      return [];
+    }
   }
 
-  async function findDuplicates(asset) {
-    const full = await ensureFull(asset);
-    const found = new Map(); // id -> { hit, reasons:Set }
-    const add = (hit, reason) => {
-      if (!hit || hit.id === asset.id) return;
-      const e = found.get(hit.id) || { hit, reasons: new Set() };
-      e.reasons.add(reason);
-      found.set(hit.id, e);
-    };
+  // ---------- the batch check ----------
+  // Returns { selected, all (Map id->asset), groups, possible, warnings, stats }
+  async function runCheck(assets, progress) {
+    const warnings = [];
+    const warn = w => { if (!warnings.includes(w)) warnings.push(w); };
+    const all = new Map(assets.map(a => [a.id, a]));
+    const remember = h => { const prev = all.get(h.id); all.set(h.id, prev ? { ...prev, ...h, metadata: { ...prev.metadata, ...h.metadata } } : h); };
 
-    const checksum = raw(md(full, CFG.CHECKSUM_FIELD));
-    if (checksum) {
-      const hits = await search(`${CFG.CHECKSUM_FIELD}:"${qEsc(checksum)}"`);
-      hits.forEach(h => add(h, 'file'));
+    // 1. Make sure we have checksum / file name / dates for the selection.
+    const needFull = assets.filter(a => !md(a, CFG.CHECKSUM_FIELD) || !md(a, 'assetCreated') || (CFG.MATCH_CAPTURE_DATE && !captureField(a)));
+    const idBatches = chunk(needFull.map(a => a.id), CFG.BATCH_SIZE);
+    let done = 0;
+    progress('Loading file details', 0, idBatches.length);
+    await pool(idBatches, async ids => {
+      (await searchAnyOf('id', ids, warn)).forEach(remember);
+      progress('Loading file details', ++done, idBatches.length);
+    });
+    const selected = assets.map(a => all.get(a.id));
+
+    // 2. Identical files (checksum).
+    const sums = [...new Set(selected.map(a => md(a, CFG.CHECKSUM_FIELD)).filter(Boolean))];
+    const sumBatches = chunk(sums, CFG.BATCH_SIZE);
+    done = 0;
+    progress('Checking identical files', 0, sumBatches.length);
+    await pool(sumBatches, async vals => {
+      (await searchAnyOf(CFG.CHECKSUM_FIELD, vals, warn)).forEach(remember);
+      progress('Checking identical files', ++done, sumBatches.length);
+    });
+
+    // 3. File names.
+    if (CFG.MATCH_FILENAME) {
+      const names = [...new Set(selected.map(a => md(a, 'filename')).filter(Boolean))];
+      const nameBatches = chunk(names, CFG.BATCH_SIZE);
+      done = 0;
+      progress('Checking file names', 0, nameBatches.length);
+      await pool(nameBatches, async vals => {
+        (await searchAnyOf('filename', vals, warn)).forEach(remember);
+        progress('Checking file names', ++done, nameBatches.length);
+      });
     }
 
-    let dateField = null, captured = null;
+    // 4. Capture date + time: one range search per field and day, exact second checked locally.
     if (CFG.MATCH_CAPTURE_DATE) {
-      dateField = captureField(full);
-      captured = dateField ? toDate(md(full, dateField)) : null;
-      if (captured && (!CFG.REQUIRE_TIME_PART || hasTime(captured))) {
-        // Day range with a margin avoids time-zone issues; exact second is checked below.
-        const q = `${dateField}:[${ymd(addDays(captured, -1))} TO ${ymd(addDays(captured, 1))}]`;
-        const hits = await search(q, 200);
-        hits.filter(h => sameSecond(toDate(md(h, dateField)), captured)).forEach(h => add(h, 'date'));
-      }
+      const days = new Map(); // "field|day" -> {field, day}
+      selected.forEach(a => {
+        const f = captureField(a), d = f && toDate(md(a, f));
+        if (d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) days.set(f + '|' + ymd(d), { f, d });
+      });
+      const dayList = [...days.values()];
+      done = 0;
+      progress('Checking capture dates', 0, dayList.length);
+      await pool(dayList, async ({ f, d }) => {
+        try {
+          const { hits, total } = await search(`${f}:[${ymd(addDays(d, -1))} TO ${ymd(addDays(d, 1))}]`, 1000);
+          if (hits.length < total) warn(`Capture date ${ymd(d)}: only ${hits.length} of ${total} files compared.`);
+          hits.forEach(remember);
+        } catch (e) { warn(`Capture date search failed: ${e?.message || e}`); }
+        progress('Checking capture dates', ++done, dayList.length);
+      });
     }
 
-    const name = raw(md(full, 'filename'));
-    if (CFG.MATCH_FILENAME && name) {
-      const hits = await search(`filename:"${qEsc(name)}"`);
-      hits.filter(h => String(md(h, 'filename') || '') === String(name)).forEach(h => add(h, 'name'));
-    }
-    return { asset: full, checksum, dateField, captured, matches: [...found.values()] };
+    // 5. Build groups of identical files. Oldest file = original, the rest = copies.
+    const everything = [...all.values()];
+    const bySum = new Map();
+    everything.forEach(a => { const s = md(a, CFG.CHECKSUM_FIELD); if (s) (bySum.get(s) || bySum.set(s, []).get(s)).push(a); });
+    const selectedIds = new Set(selected.map(a => a.id));
+    const groups = [...bySum.values()]
+      .filter(members => members.length > 1 && members.some(m => selectedIds.has(m.id)))
+      .map(members => {
+        const sorted = [...members].sort((x, y) => createdTime(x) - createdTime(y) || String(x.id).localeCompare(String(y.id)));
+        return { original: sorted[0], copies: sorted.slice(1) };
+      });
+    const inGroup = new Set(groups.flatMap(g => [g.original, ...g.copies].map(a => a.id)));
+
+    // 6. Possible duplicates: same capture time or same file name, but not the same file.
+    const bySecond = new Map(), byName = new Map();
+    everything.forEach(a => {
+      const d = captureDate(a);
+      if (d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) (bySecond.get(secondKey(d)) || bySecond.set(secondKey(d), []).get(secondKey(d))).push(a);
+      const n = md(a, 'filename');
+      if (CFG.MATCH_FILENAME && n) (byName.get(n) || byName.set(n, []).get(n)).push(a);
+    });
+    const possible = [];
+    selected.forEach(a => {
+      const sum = md(a, CFG.CHECKSUM_FIELD);
+      const others = new Map();
+      const add = (list, reason) => (list || []).forEach(o => {
+        if (o.id === a.id) return;
+        if (sum && md(o, CFG.CHECKSUM_FIELD) === sum) return; // already an identical file
+        const e = others.get(o.id) || { asset: o, reasons: new Set() };
+        e.reasons.add(reason); others.set(o.id, e);
+      });
+      const d = captureDate(a);
+      if (CFG.MATCH_CAPTURE_DATE && d && (!CFG.REQUIRE_TIME_PART || hasTime(d))) add(bySecond.get(secondKey(d)), 'date');
+      if (CFG.MATCH_FILENAME && md(a, 'filename')) add(byName.get(md(a, 'filename')), 'name');
+      if (others.size) possible.push({ asset: a, others: [...others.values()] });
+    });
+
+    const noData = selected.filter(a => !md(a, CFG.CHECKSUM_FIELD) && !captureDate(a) && !md(a, 'filename')).length;
+    return { selected, groups, possible, warnings, inGroup, noData };
   }
 
   // ---------- render ----------
   function renderMessage(html, warn = false) {
     $out.innerHTML = `<div class="msg${warn ? ' warn' : ''}">${html}</div>`;
   }
+  function setBanner(text) { $banner.innerHTML = text ? `<div class="banner">${esc(text)}</div>` : ''; }
 
-  function cardShell(asset, statusHtml, extra = '') {
-    return `<div class="card">
-      <div class="row">
-        <img class="thumb" src="${esc(asset.thumbnailUrl || '')}" alt="" onerror="this.style.visibility='hidden'" />
-        <div class="meta">
-          <p class="name" title="${esc(fileName(asset))}">${esc(fileName(asset))}</p>
-          <p class="sub">${esc(folderOf(asset))}</p>
-        </div>
-      </div>
-      ${statusHtml}${extra}
+  function renderProgress(total, label, done, steps) {
+    const pct = steps ? Math.round((done / steps) * 100) : 0;
+    $out.innerHTML = `<div class="card">
+      <p class="name">Checking ${total} file${total > 1 ? 's' : ''}…</p>
+      <p class="sub">${esc(label)}${steps ? ` (${done} of ${steps})` : ''}</p>
+      <div class="bar"><span style="width:${pct}%"></span></div>
     </div>`;
   }
 
-  function renderResult(r) {
-    const { asset, checksum, captured, matches } = r;
-    if (!checksum && !captured && !matches.length) {
-      return cardShell(asset, `<span class="status info"><span class="dot"></span>Cannot check: no checksum or capture date on this file</span>`);
-    }
-    if (!matches.length) {
-      return cardShell(asset, `<span class="status ok"><span class="dot"></span>No duplicates found</span>`);
-    }
-    const n = matches.length;
-    const list = matches.map(({ hit, reasons }) => `
-      <button class="match" data-open="${esc(hit.id)}" title="Open in Assets">
-        <div class="row">
-          <img class="thumb sm" src="${esc(hit.thumbnailUrl || '')}" alt="" onerror="this.style.visibility='hidden'" />
-          <div class="meta">
-            <p class="name">${esc(fileName(hit))}</p>
-            <p class="sub">${esc(folderOf(hit))}</p>
-            <div class="chips">
-              ${reasons.has('file') ? '<span class="chip strong">Identical file</span>' : ''}
-              ${reasons.has('date') ? '<span class="chip">Same capture time</span>' : ''}
-              ${reasons.has('name') ? '<span class="chip">Same file name</span>' : ''}
-            </div>
-          </div>
+  const row = (a, chips) => `
+    <button class="match" data-open="${esc(a.id)}" title="Open in Assets">
+      <div class="row">
+        <img class="thumb sm" src="${esc(a.thumbnailUrl || '')}" alt="" onerror="this.style.visibility='hidden'" />
+        <div class="meta">
+          <p class="name">${esc(fileName(a))}</p>
+          <p class="sub">${esc(folderOf(a))}</p>
+          ${chips ? `<div class="chips">${chips}</div>` : ''}
         </div>
-      </button>`).join('');
-    const ids = matches.map(m => m.hit.id);
-    const extra = `<div class="matches">${list}</div>
-      <button class="link" data-open-all="${esc([asset.id, ...ids].join(','))}">Open all ${n + 1} side by side</button>`;
-    const notes = [];
-    if (!checksum) notes.push('No checksum, matched on capture time only');
-    if (captured) notes.push(`Captured ${esc(fmtDate(captured))}`);
-    return cardShell(asset,
-      `<span class="status warn"><span class="dot"></span>${n} possible duplicate${n > 1 ? 's' : ''}</span>
-       ${notes.length ? `<p class="sub" style="margin-top:6px">${notes.join(' · ')}</p>` : ''}`,
-      extra);
+      </div>
+    </button>`;
+
+  let lastCopies = [];
+  function renderResult(r) {
+    const copies = r.groups.flatMap(g => g.copies);
+    lastCopies = copies;
+    const n = r.selected.length;
+    const parts = [];
+
+    // Summary
+    const clean = !r.groups.length && !r.possible.length;
+    parts.push(`<div class="card">
+      <span class="status ${clean ? 'ok' : 'warn'}"><span class="dot"></span>${clean
+        ? `No duplicates found in ${n} file${n > 1 ? 's' : ''}`
+        : `${n} file${n > 1 ? 's' : ''} checked`}</span>
+      ${clean ? '' : `<p class="sub" style="margin-top:8px;white-space:normal">
+        ${r.groups.length ? `<b>${copies.length}</b> identical cop${copies.length === 1 ? 'y' : 'ies'} in ${r.groups.length} group${r.groups.length > 1 ? 's' : ''}` : 'No identical files'}${r.possible.length ? ` · <b>${r.possible.length}</b> possible duplicate${r.possible.length > 1 ? 's' : ''} to review` : ''}
+      </p>`}
+      ${copies.length ? `<button class="btn" id="showCopies">Show ${copies.length} cop${copies.length === 1 ? 'y' : 'ies'} in Assets</button>
+        <p class="sub" style="white-space:normal;margin-top:6px">Opens only the copies, not the originals. Select them there and delete with the normal Assets action.</p>` : ''}
+      ${r.noData ? `<p class="sub" style="white-space:normal;margin-top:6px">${r.noData} file${r.noData > 1 ? 's have' : ' has'} no checksum, capture date or file name and could not be checked.</p>` : ''}
+    </div>`);
+
+    if (r.warnings.length) {
+      parts.push(`<div class="msg warn" style="max-width:none;margin:0 0 12px">${r.warnings.slice(0, 5).map(esc).join('<br>')}</div>`);
+    }
+
+    // Identical groups
+    if (r.groups.length) {
+      parts.push(`<h2>Identical files</h2>`);
+      r.groups.slice(0, 100).forEach(g => {
+        parts.push(`<div class="card group">
+          ${row(g.original, '<span class="chip ok">Keep · oldest</span>')}
+          ${g.copies.map(c => row(c, '<span class="chip strong">Copy</span>')).join('')}
+        </div>`);
+      });
+      if (r.groups.length > 100) parts.push(`<div class="msg">${r.groups.length - 100} more groups not shown. "Show copies" includes all of them.</div>`);
+    }
+
+    // Possible duplicates
+    if (r.possible.length) {
+      parts.push(`<h2>Possible duplicates <span class="hint">review, not included in "Show copies"</span></h2>`);
+      r.possible.slice(0, 100).forEach(p => {
+        parts.push(`<div class="card group">
+          ${row(p.asset, '<span class="chip">Selected file</span>')}
+          ${p.others.map(o => row(o.asset,
+            (o.reasons.has('date') ? '<span class="chip">Same capture time</span>' : '') +
+            (o.reasons.has('name') ? '<span class="chip">Same file name</span>' : ''))).join('')}
+        </div>`);
+      });
+      if (r.possible.length > 100) parts.push(`<div class="msg">${r.possible.length - 100} more not shown.</div>`);
+    }
+
+    $out.innerHTML = parts.join('');
   }
+
+  // Open only the copies in the Assets grid.
+  async function showCopies() {
+    const ids = [...new Set(lastCopies.map(c => c.id))];
+    if (!ids.length) return;
+    const btn = document.getElementById('showCopies');
+    if (btn) { btn.disabled = true; btn.textContent = 'Opening…'; }
+    try {
+      if (ids.length <= CFG.MAX_IDS_IN_SEARCH) {
+        await client.openSearch(`id:(${ids.map(id => `"${qEsc(id)}"`).join(' OR ')})`, 'assetCreated-desc');
+      } else {
+        // Too many ids for one search: tag the copies, then search on the tag.
+        for (const part of chunk(ids, 200)) await client.updateBulkById(part, { [CFG.COPY_FLAG_FIELD]: CFG.COPY_FLAG_VALUE });
+        await client.openSearch(`${CFG.COPY_FLAG_FIELD}:"${qEsc(CFG.COPY_FLAG_VALUE)}"`, 'assetCreated-desc');
+      }
+      setBanner(`Showing ${ids.length} cop${ids.length === 1 ? 'y' : 'ies'} in Assets. Review, select all and delete there.`);
+    } catch (e) {
+      setBanner('Could not open the copies: ' + (e?.message || e));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = `Show ${ids.length} cop${ids.length === 1 ? 'y' : 'ies'} in Assets`; }
+    }
+  }
+
+  $out.addEventListener('click', async ev => {
+    if (ev.target.closest('#showCopies')) return showCopies();
+    const one = ev.target.closest('[data-open]');
+    if (one) { try { await client.openAssets([one.dataset.open]); } catch (e) { console.warn('openAssets failed', e); } }
+  });
 
   let runId = 0;
   async function check(assets, source = 'selection') {
     const my = ++runId;
     assets = (assets || []).filter(Boolean);
     if (!assets.length) {
-      renderMessage('Select one or more files to check whether they already exist in Assets.');
+      renderMessage('Select one or more files, or a whole folder\'s contents, to check whether they already exist in Assets.');
       return;
     }
     const capped = assets.slice(0, CFG.MAX_SELECTION);
-    $out.innerHTML = capped.map(a => cardShell(a, `<span class="status busy"><span class="spin"></span>Checking…</span>`)).join('')
-      + (assets.length > capped.length ? `<div class="msg">Only the first ${CFG.MAX_SELECTION} files are checked.</div>` : '');
-
-    const results = [];
-    for (const a of capped) {
-      try { results.push({ ok: true, r: await findDuplicates(a) }); }
-      catch (e) { results.push({ ok: false, a, e }); }
-      if (my !== runId) return; // selection changed meanwhile
-    }
-
-    // Duplicates first, so they are seen without scrolling.
-    results.sort((x, y) => (y.ok ? y.r.matches.length : 0) - (x.ok ? x.r.matches.length : 0));
-    const total = results.filter(x => x.ok && x.r.matches.length).length;
-    const summary = capped.length > 1
-      ? `<div class="msg" style="max-width:none;margin:0 0 12px;text-align:left">${total ? `<b>${total} of ${capped.length}</b> files may already exist.` : `None of the ${capped.length} files were found elsewhere.`}</div>`
-      : '';
-    $out.innerHTML = summary + results.map(x => x.ok
-      ? renderResult(x.r)
-      : cardShell(x.a, `<span class="status info"><span class="dot"></span>Check failed: ${esc(x.e?.message || x.e)}</span>`)
-    ).join('');
-    if (source === 'upload') setBanner('Upload finished. Your newest files were checked automatically.');
-  }
-
-  function setBanner(text) {
-    $banner.innerHTML = text ? `<div class="banner">${esc(text)}</div>` : '';
-  }
-
-  // Clicks: open one asset, or open the original + all matches.
-  $out.addEventListener('click', async ev => {
-    const one = ev.target.closest('[data-open]');
-    const all = ev.target.closest('[data-open-all]');
+    renderProgress(capped.length, 'Starting', 0, 0);
     try {
-      if (one) await client.openAssets([one.dataset.open]);
-      else if (all) await client.openAssets(all.dataset.openAll.split(','));
-    } catch (e) { console.warn('openAssets failed', e); }
-  });
+      const r = await runCheck(capped, (label, done, steps) => { if (my === runId) renderProgress(capped.length, label, done, steps); });
+      if (my !== runId) return; // selection changed meanwhile
+      if (assets.length > capped.length) r.warnings.unshift(`Only the first ${CFG.MAX_SELECTION} of ${assets.length} selected files were checked.`);
+      renderResult(r);
+      if (source === 'upload') setBanner('Upload finished. Your newest files were checked automatically.');
+    } catch (e) {
+      if (my === runId) renderMessage('Check failed: ' + esc(e?.message || e), true);
+    }
+  }
 
   // ---------- after-upload check ----------
   function currentUsername() {
@@ -318,17 +444,11 @@
       return p.username || p.userName || p.name || null;
     } catch { return null; }
   }
-
   async function checkLatestUploads(count) {
     const user = currentUsername();
-    if (!user) {
-      setBanner('Upload finished. Select the new files to check them.');
-      return;
-    }
-    // Newest assets created by this user = the files that were just uploaded.
+    if (!user) { setBanner('Upload finished. Select the new files to check them.'); return; }
     const res = await client.search({ q: `assetCreator:"${qEsc(user)}"`, num: count, sort: 'assetCreated-desc' });
-    const newest = (res?.hits || []).slice(0, count);
-    await check(newest, 'upload');
+    await check((res?.hits || []).slice(0, count), 'upload');
   }
 
   // ---------- start ----------
@@ -339,52 +459,64 @@
     throw e;
   }
 
-  let lastSelection = client.getSelection() || [];
   let debounce;
   client.onSelectionUpdate(assets => {
-    lastSelection = assets || [];
     setBanner('');
     clearTimeout(debounce);
-    debounce = setTimeout(() => check(lastSelection), 250);
+    debounce = setTimeout(() => check(assets || []), 400);
   });
-
   if (CFG.AUTO_CHECK_AFTER_UPLOAD && client.onUploadProgress) {
     client.onUploadProgress(p => {
-      if (p?.state === 'uploaded' && p.uploaded > 0) {
-        checkLatestUploads(Math.min(p.uploaded, CFG.MAX_SELECTION)).catch(e => console.warn(e));
-      }
+      if (p?.state === 'uploaded' && p.uploaded > 0) checkLatestUploads(Math.min(p.uploaded, 50)).catch(e => console.warn(e));
     });
   }
-
-  check(lastSelection);
+  check(client.getSelection() || []);
 
   // ---------- demo mode (?demo=1) for testing outside Assets ----------
   function makeDemoClient() {
-    const t = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="#cfe3ef"/><circle cx="14" cy="14" r="5" fill="#fff"/><path d="M0 34 L14 22 L24 30 L32 24 L40 32 L40 40 L0 40Z" fill="#7fb0cc"/></svg>');
-    const A = (id, filename, folderPath, sum, created) => ({ id, thumbnailUrl: t,
-      metadata: { filename, folderPath, firstExtractedChecksum: sum, created } });
-    const db = [
-      A('n1', 'IMG_4711.jpg', '/Coop/Inbox/2026-10', 'sha1:aaa', '2026-06-14T09:12:33Z'),
-      A('o1', 'Erdbeeren_Markt.jpg', '/Coop/Archiv/2026/Juni', 'sha1:aaa', '2026-06-14T09:12:33Z'),
-      A('o2', 'Erdbeeren_Markt_web.jpg', '/Coop/Web/Kampagnen', 'sha1:bbb', '2026-06-14T09:12:33Z'),
-      A('n2', 'Filiale_Bern.jpg', '/Coop/Inbox/2026-10', 'sha1:ccc', '2026-09-02T14:01:10Z'),
-      A('n3', 'scan_0003.tif', '/Coop/Inbox/2026-10', null, null),
-    ];
-    const sel = [db[0], db[3], db[4]];
+    const t = c => 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="${c}"/><circle cx="14" cy="14" r="5" fill="#fff"/><path d="M0 34 L14 22 L24 30 L32 24 L40 32 L40 40 L0 40Z" fill="#7fb0cc"/></svg>`);
+    let n = 0;
+    const A = (filename, folderPath, sum, created, assetCreated, color = '#cfe3ef') => ({ id: 'id' + (++n), thumbnailUrl: t(color),
+      metadata: { filename, folderPath, firstExtractedChecksum: sum, created, assetCreated } });
+    const db = [];
+    // 120 unique files in the selected folder
+    for (let i = 0; i < 120; i++) db.push(A(`photo-${i}.jpg`, '/Stock photos/Unsplash', 'sha1:u' + i, `2026-05-${String(1 + (i % 28)).padStart(2, '0')}T10:${String(i % 60).padStart(2, '0')}:00Z`, '2026-05-18T13:00:00Z'));
+    // originals elsewhere, older
+    db.push(A('strawberries.jpg', '/Archive/2025', 'sha1:dupA', '2025-06-14T09:12:33Z', '2025-06-20T08:00:00Z', '#f5c2c2'));
+    db.push(A('market.jpg', '/Archive/2025', 'sha1:dupB', '2025-07-01T11:00:05Z', '2025-07-02T08:00:00Z', '#c2f5d0'));
+    db.push(A('IMG_0001.jpg', '/Archive/2024', 'sha1:other', '2024-01-01T08:00:00Z', '2024-01-02T08:00:00Z'));
+    // copies inside the selected folder, newer
+    db.push(A('strawberries.jpg', '/Stock photos/Unsplash', 'sha1:dupA', '2025-06-14T09:12:33Z', '2026-05-18T13:00:00Z', '#f5c2c2'));
+    db.push(A('strawberries-2.jpg', '/Stock photos/Unsplash', 'sha1:dupA', '2025-06-14T09:12:33Z', '2026-05-18T13:05:00Z', '#f5c2c2'));
+    db.push(A('market_final.jpg', '/Stock photos/Unsplash', 'sha1:dupB', '2025-07-01T11:00:05Z', '2026-05-18T13:00:00Z', '#c2f5d0'));
+    // possible: cropped version (other checksum, same capture time) and same name
+    db.push(A('market_crop.jpg', '/Stock photos/Unsplash', 'sha1:crop', '2025-07-01T11:00:05Z', '2026-05-18T13:10:00Z', '#c2f5d0'));
+    db.push(A('IMG_0001.jpg', '/Stock photos/Unsplash', 'sha1:img1', '2026-02-02T09:00:00Z', '2026-05-18T13:00:00Z'));
+    const sel = db.filter(a => a.metadata.folderPath === '/Stock photos/Unsplash')
+      .map(a => ({ id: a.id, thumbnailUrl: a.thumbnailUrl, metadata: { filename: a.metadata.filename, folderPath: a.metadata.folderPath } }));
+    const fieldVal = (a, f) => a.metadata[f];
+    window.__demoCalls = [];
     return {
       getSelection: () => sel,
       onSelectionUpdate: () => () => {},
       onUploadProgress: () => () => {},
       getPluginContext: () => ({ app: { userProfile: { username: 'demo' } } }),
-      openAssets: async ids => console.log('openAssets', ids),
+      openAssets: async ids => window.__demoCalls.push(['openAssets', ids]),
+      openSearch: async (q, s) => window.__demoCalls.push(['openSearch', q, s]),
+      updateBulkById: async (ids, m) => window.__demoCalls.push(['updateBulkById', ids.length, m]),
       search: async ({ q, num }) => {
-        await new Promise(r => setTimeout(r, 300));
-        let hits = [];
-        let m;
-        if ((m = q.match(/^id:"(.+)"$/))) hits = db.filter(a => a.id === m[1]);
-        else if ((m = q.match(/^firstExtractedChecksum:"(.+)"$/))) hits = db.filter(a => a.metadata.firstExtractedChecksum === m[1]);
-        else if ((m = q.match(/^created:\[(\S+) TO (\S+)\]$/))) hits = db.filter(a => a.metadata.created && a.metadata.created.slice(0,10) >= m[1] && a.metadata.created.slice(0,10) <= m[2]);
-        return { total: hits.length, hits: hits.slice(0, num || 50) };
+        await new Promise(r => setTimeout(r, 30));
+        let m, hits = [];
+        if ((m = q.match(/^(\w+):\((.+)\)$/))) {
+          const vals = [...m[2].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(x => x[1]);
+          hits = db.filter(a => vals.includes(String(m[1] === 'id' ? a.id : fieldVal(a, m[1]))));
+        } else if ((m = q.match(/^(\w+):"(.+)"$/))) {
+          hits = db.filter(a => String(m[1] === 'id' ? a.id : fieldVal(a, m[1])) === m[2]);
+        } else if ((m = q.match(/^(\w+):\[(\S+) TO (\S+)\]$/))) {
+          hits = db.filter(a => { const v = fieldVal(a, m[1]); return v && v.slice(0, 10) >= m[2] && v.slice(0, 10) <= m[3]; });
+        }
+        const cap = 50; // mimic a capped page size
+        return { total: hits.length, hits: hits.slice(0, Math.min(num || 50, cap)) };
       },
     };
   }

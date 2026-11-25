@@ -19,11 +19,18 @@ window.PLUGIN_CONFIG = {
   // because "same day" alone gives too many false matches.
   REQUIRE_TIME_PART: true,
 
-  // Max number of selected assets to check at once.
-  MAX_SELECTION: 20,
+  // Max number of selected assets to check at once (e.g. a whole folder).
+  MAX_SELECTION: 1000,
 
-  // Max hits per search.
-  MAX_HITS: 50,
+  // How many values are combined in one search, and how many searches run at the same time.
+  BATCH_SIZE: 20,
+  CONCURRENCY: 4,
+
+  // "Show copies in Assets": up to this many copies are opened with an id search.
+  // Above it, the copies are first tagged in this field, then the panel searches on the tag.
+  MAX_IDS_IN_SEARCH: 100,
+  COPY_FLAG_FIELD: 'cf_duplicateCheck',
+  COPY_FLAG_VALUE: 'Duplicate copy',
 
   // After an upload in the host finishes, check the newest assets of the
   // current user automatically (needs a username in the plugin context).

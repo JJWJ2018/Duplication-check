@@ -22,6 +22,21 @@ SDK: `@woodwing/a10-client-sdk@1.0.4`.
 - **Na upload:** als de host meldt dat een upload klaar is, controleert het paneel de
   nieuwste bestanden van de huidige gebruiker automatisch (zie "te verifiëren").
 
+## Hele map controleren en kopieën opruimen
+- Selecteer tot 1.000 bestanden (bijv. alles in een map) en open het paneel. Het controleert
+  in groepen (checksum en bestandsnaam per 20 tegelijk, opnamedatum per dag) met een
+  voortgangsbalk.
+- **Identical files:** groepen met dezelfde checksum. Het oudste bestand (`assetCreated`) is
+  *Keep · oldest*, de rest *Copy*.
+- **Show copies in Assets:** opent alleen de kopieën in het raster (zoekopdracht op ID's).
+  Daar selecteer je alles en verwijder je met de gewone Assets-actie. Het paneel verwijdert
+  zelf niets. Boven de 100 kopieën worden ze eerst gemarkeerd in `cf_duplicateCheck` =
+  *Duplicate copy* en zoekt het paneel daarop.
+- **Possible duplicates** (zelfde opnametijd of bestandsnaam, ander bestand) staan apart ter
+  beoordeling en zitten níet in "Show copies".
+- Te verifiëren: of Assets bij een grote selectie alle bestanden doorgeeft aan het paneel, en
+  of de zoekopdracht `veld:("a" OR "b")` werkt (bij een fout splitst het paneel automatisch).
+
 ## Bestanden
 - `index.html` — UI + SDK-koppeling. `?demo=1` draait met voorbeelddata, zonder Assets.
 - `config.js` — veldnamen en opties. **Controleer de veldnamen.**
